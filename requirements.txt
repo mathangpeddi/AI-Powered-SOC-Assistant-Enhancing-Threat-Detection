@@ -6,3 +6,10 @@ streamlit
 joblib
 xgboost
 scikit-learn
+openai
+sentence-transformers
+numpy
+maxminddb
+geoip2
+ipwhois
+pycountry
