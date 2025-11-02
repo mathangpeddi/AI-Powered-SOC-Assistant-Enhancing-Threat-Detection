@@ -9,6 +9,7 @@ import random
 import os
 import csv
 from collections import Counter, defaultdict
+from datetime import datetime
 
 # AI/ML imports (optional - will fail gracefully if not installed)
 try:
@@ -819,6 +820,13 @@ def ingest(payload: dict | list = Body(...)):
         raise HTTPException(status_code=400, detail="Invalid body for /ingest")
 
     normed = [_normalize(a) for a in alerts if isinstance(a, dict)]
+    
+    # Add timestamp if not present
+    current_time = datetime.utcnow().isoformat()
+    for alert in normed:
+        if "timestamp" not in alert or not alert.get("timestamp"):
+            alert["timestamp"] = current_time
+    
     ALERTS.extend(normed)
     return {"received": len(normed), "total": len(ALERTS)}
 
@@ -1242,4 +1250,264 @@ def geo_summary():
         "countries": geo_summary,
         "total_alerts_analyzed": len(sample_alerts),
         "total_countries": len(geo_summary)
+    }
+
+
+@app.get("/analytics/mitre-techniques")
+def mitre_techniques_analytics(
+    limit: int = Query(500, ge=1, le=5000, description="Number of recent alerts to analyze")
+):
+    """
+    Get Top MITRE Techniques with percentages.
+    Returns top 5 MITRE techniques observed with their frequencies and percentages.
+    """
+    if not ALERTS:
+        return {
+            "techniques": [],
+            "total_alerts": 0,
+            "analyzed_alerts": 0
+        }
+    
+    # Get recent alerts up to limit
+    result = sorted(ALERTS, key=lambda x: int(x.get("row_id", 0)))
+    result = result[-limit:] if len(result) > limit else result
+    
+    # Count MITRE techniques
+    technique_counter = Counter()
+    total_technique_occurrences = 0
+    
+    for alert in result:
+        mitre_tags = alert.get("mitre_tags", [])
+        if isinstance(mitre_tags, list):
+            for tag in mitre_tags:
+                if tag:  # Skip empty tags
+                    technique_counter[tag] += 1
+                    total_technique_occurrences += 1
+    
+    # Get top 5 techniques
+    top_techniques = technique_counter.most_common(5)
+    
+    # Build response with percentages
+    techniques_data = []
+    for technique, count in top_techniques:
+        percentage = (count / total_technique_occurrences * 100) if total_technique_occurrences > 0 else 0
+        techniques_data.append({
+            "technique_id": technique,
+            "count": count,
+            "percentage": round(percentage, 2)
+        })
+    
+    return {
+        "techniques": techniques_data,
+        "total_alerts": len(ALERTS),
+        "analyzed_alerts": len(result),
+        "total_technique_occurrences": total_technique_occurrences
+    }
+
+
+@app.get("/analytics/timeseries")
+def timeseries_analytics(
+    interval_minutes: int = Query(5, ge=1, le=60, description="Time interval in minutes for grouping"),
+    limit: int = Query(500, ge=1, le=5000, description="Number of recent alerts to analyze")
+):
+    """
+    Get time-series analytics for alerts.
+    Returns alert frequency, top ports, and top IPs over time intervals.
+    """
+    if not ALERTS:
+        return {
+            "frequency": [],
+            "ports": [],
+            "ips": [],
+            "interval_minutes": interval_minutes
+        }
+    
+    # Get recent alerts
+    result = sorted(ALERTS, key=lambda x: int(x.get("row_id", 0)))
+    result = result[-limit:] if len(result) > limit else result
+    
+    # Parse timestamps and group by intervals
+    from collections import defaultdict as dd
+    interval_seconds = interval_minutes * 60
+    
+    freq_by_time = dd(int)
+    ports_by_time = dd(Counter)
+    ips_by_time = dd(Counter)
+    
+    for alert in result:
+        timestamp_str = alert.get("timestamp")
+        if not timestamp_str:
+            # Use row_id as proxy for time if no timestamp
+            alert_time = int(alert.get("row_id", 0))
+            time_bucket = (alert_time // (interval_seconds // 30)) * (interval_seconds // 30)
+        else:
+            try:
+                if isinstance(timestamp_str, str):
+                    alert_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                else:
+                    alert_time = timestamp_str
+                # Convert to seconds since epoch, then bucket
+                time_bucket = int(alert_time.timestamp() // interval_seconds) * interval_seconds
+            except:
+                # Fallback to row_id if timestamp parsing fails
+                alert_time = int(alert.get("row_id", 0))
+                time_bucket = (alert_time // (interval_seconds // 30)) * (interval_seconds // 30)
+        
+        freq_by_time[time_bucket] += 1
+        
+        # Track ports
+        dst_port = alert.get("dst_port")
+        if dst_port:
+            ports_by_time[time_bucket][dst_port] += 1
+        
+        # Track source IPs
+        src_ip = alert.get("src_ip")
+        if src_ip:
+            ips_by_time[time_bucket][src_ip] += 1
+    
+    # Convert to sorted lists
+    sorted_times = sorted(freq_by_time.keys())
+    
+    frequency_data = [
+        {
+            "time": datetime.fromtimestamp(t).isoformat() if t > 1000000000 else f"Bucket {t}",
+            "count": freq_by_time[t],
+            "timestamp": t
+        }
+        for t in sorted_times
+    ]
+    
+    ports_data = []
+    ips_data = []
+    
+    for t in sorted_times:
+        # Top 3 ports for this interval
+        top_ports = ports_by_time[t].most_common(3)
+        ports_data.append({
+            "time": datetime.fromtimestamp(t).isoformat() if t > 1000000000 else f"Bucket {t}",
+            "timestamp": t,
+            "ports": [{"port": p, "count": c} for p, c in top_ports]
+        })
+        
+        # Top 3 IPs for this interval
+        top_ips = ips_by_time[t].most_common(3)
+        ips_data.append({
+            "time": datetime.fromtimestamp(t).isoformat() if t > 1000000000 else f"Bucket {t}",
+            "timestamp": t,
+            "ips": [{"ip": ip, "count": c} for ip, c in top_ips]
+        })
+    
+    return {
+        "frequency": frequency_data,
+        "ports": ports_data,
+        "ips": ips_data,
+        "interval_minutes": interval_minutes,
+        "total_intervals": len(sorted_times)
+    }
+
+
+@app.get("/alerts/{alert_id}/explain-features")
+def explain_alert_features(alert_id: int):
+    """
+    Get feature importance explanation for a specific alert.
+    Returns SHAP-like feature importance scores showing why the alert was flagged.
+    """
+    # Find the alert
+    alert = None
+    for a in ALERTS:
+        if int(a.get("row_id", 0)) == alert_id:
+            alert = a
+            break
+    
+    if not alert:
+        raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
+    
+    # Calculate feature importance scores (simplified SHAP-like explanation)
+    feature_importance = {}
+    explanations = []
+    
+    # y_prob (threat probability) is the main indicator
+    y_prob = alert.get("y_prob", 0.0)
+    
+    # Calculate importance for each feature
+    dst_port = alert.get("dst_port", 0)
+    protocol = alert.get("protocol", "").upper()
+    pps = alert.get("approx_packets_per_s", 0.0)
+    bps = alert.get("approx_bytes_per_s", 0.0)
+    mitre_tags = alert.get("mitre_tags", [])
+    
+    # Port-based importance
+    risky_ports = {22: 0.25, 23: 0.3, 21: 0.2, 3389: 0.35, 1433: 0.3, 3306: 0.25}
+    if dst_port in risky_ports:
+        port_score = risky_ports[dst_port]
+        feature_importance["dst_port"] = {
+            "value": dst_port,
+            "importance": port_score,
+            "impact": "positive" if port_score > 0.15 else "neutral",
+            "explanation": f"Port {dst_port} is commonly targeted for {protocol if protocol else 'attacks'}"
+        }
+        explanations.append(f"⚠️ Port {dst_port} ({protocol}) is a high-risk port ({port_score:.0%} contribution)")
+    
+    # Packet rate importance
+    if pps > 500:
+        pps_score = min(0.3, (pps - 500) / 2000)
+        feature_importance["approx_packets_per_s"] = {
+            "value": round(pps, 2),
+            "importance": pps_score,
+            "impact": "positive",
+            "explanation": f"High packet rate ({pps:.0f} pps) suggests aggressive scanning or DDoS"
+        }
+        explanations.append(f"📈 High packet rate ({pps:.0f} pps) increases threat score by {pps_score:.0%}")
+    
+    # Byte rate importance
+    if bps > 1e7:  # > 10 MB/s
+        bps_score = min(0.25, (bps - 1e7) / 5e7)
+        feature_importance["approx_bytes_per_s"] = {
+            "value": round(bps, 2),
+            "importance": bps_score,
+            "impact": "positive",
+            "explanation": f"High bandwidth usage ({bps/1e6:.1f} MB/s) suggests data exfiltration"
+        }
+        explanations.append(f"💾 High bandwidth ({bps/1e6:.1f} MB/s) contributes {bps_score:.0%} to threat score")
+    
+    # MITRE tags importance
+    if mitre_tags:
+        mitre_score = min(0.4, len(mitre_tags) * 0.15)
+        feature_importance["mitre_tags"] = {
+            "value": mitre_tags,
+            "importance": mitre_score,
+            "impact": "positive",
+            "explanation": f"MITRE techniques detected: {', '.join(mitre_tags)}"
+        }
+        explanations.append(f"🎯 MITRE techniques ({', '.join(mitre_tags)}) contribute {mitre_score:.0%} to threat score")
+    
+    # Protocol importance
+    if protocol in ["TCP", "UDP"]:
+        protocol_score = 0.05
+        feature_importance["protocol"] = {
+            "value": protocol,
+            "importance": protocol_score,
+            "impact": "neutral",
+            "explanation": f"{protocol} protocol usage"
+        }
+    
+    # Sort features by importance
+    sorted_features = sorted(
+        feature_importance.items(),
+        key=lambda x: x[1].get("importance", 0),
+        reverse=True
+    )
+    
+    # Calculate total explainable score
+    total_explained = sum(f.get("importance", 0) for f in feature_importance.values())
+    
+    return {
+        "alert_id": alert_id,
+        "y_prob": y_prob,
+        "features": {k: v for k, v in sorted_features},
+        "explanations": explanations,
+        "total_feature_importance": round(total_explained, 3),
+        "remaining_score": round(max(0, y_prob - total_explained), 3),
+        "interpretation": f"This alert was flagged with {y_prob:.1%} threat probability. "
+                         f"The key factors contributing to this score are explained above."
     }

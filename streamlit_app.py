@@ -33,6 +33,7 @@ if st.sidebar.button("Reset session stats"):
     st.session_state.pop("last_seen_row_id", None)
     st.success("Session stats reset. The table will recompute on next refresh.")
 
+
 # ---------------- data fetch helpers ----------------
 def fetch_json(path: str, params=None):
     try:
@@ -224,6 +225,147 @@ with tab3:
                     ],
                     use_container_width=True,
                 )
+            
+            # SHAP-like Feature Importance
+            st.markdown("---")
+            st.markdown("#### 🔍 Feature Importance (SHAP-like Explanation)")
+            feature_data, feature_err = fetch_json(f"/alerts/{int(alert_id_to_explain)}/explain-features")
+            if feature_err:
+                st.warning(f"Feature explanation unavailable: {feature_err}")
+            elif feature_data:
+                # Display feature importance as bars
+                if feature_data.get("features"):
+                    features = feature_data["features"]
+                    
+                    # Create a DataFrame for visualization
+                    feature_list = []
+                    for feat_name, feat_info in features.items():
+                        feature_list.append({
+                            "Feature": feat_name.replace("_", " ").title(),
+                            "Importance": feat_info.get("importance", 0),
+                            "Value": str(feat_info.get("value", "")),
+                            "Impact": feat_info.get("impact", "neutral")
+                        })
+                    
+                    if feature_list:
+                        feat_df = pd.DataFrame(feature_list)
+                        feat_df = feat_df.sort_values("Importance", ascending=True)
+                        
+                        # Show as horizontal bar chart
+                        st.bar_chart(feat_df.set_index("Feature")[["Importance"]])
+                        
+                        # Show detailed explanations
+                        if feature_data.get("explanations"):
+                            st.markdown("**Detailed Explanations:**")
+                            for explanation in feature_data["explanations"]:
+                                st.write(f"- {explanation}")
+                        
+                        st.caption(
+                            f"Total explainable: {feature_data.get('total_feature_importance', 0):.1%} | "
+                            f"Base threat probability: {feature_data.get('y_prob', 0):.1%}"
+                        )
+
+# Analytics & Explainability Section
+st.divider()
+st.subheader("📊 Analytics & Explainability")
+
+# Top MITRE Techniques
+st.markdown("### 🎯 Top 5 MITRE Techniques Observed Today")
+mitre_analytics, mitre_analytics_err = fetch_json("/analytics/mitre-techniques", params={"limit": 500})
+if mitre_analytics_err:
+    st.warning(f"MITRE analytics unavailable: {mitre_analytics_err}")
+elif mitre_analytics and mitre_analytics.get("techniques"):
+    techniques = mitre_analytics["techniques"]
+    if techniques:
+        # Create two columns for better layout
+        cols = st.columns(len(techniques) if len(techniques) <= 5 else 5)
+        
+        for idx, tech in enumerate(techniques):
+            with cols[idx % len(cols)]:
+                st.metric(
+                    label=tech.get("technique_id", "Unknown"),
+                    value=f"{tech.get('percentage', 0)}%",
+                    delta=f"{tech.get('count', 0)} occurrences"
+                )
+        
+        # Also show as a bar chart
+        if len(techniques) > 0:
+            tech_df = pd.DataFrame(techniques)
+            tech_df = tech_df.set_index("technique_id")
+            st.bar_chart(tech_df[["percentage"]])
+            st.caption(f"Analyzed {mitre_analytics.get('analyzed_alerts', 0)} alerts | Total occurrences: {mitre_analytics.get('total_technique_occurrences', 0)}")
+    else:
+        st.info("No MITRE techniques found in recent alerts.")
+else:
+    st.info("No MITRE analytics available yet.")
+
+# Time-Series Plots
+st.markdown("### 📈 Time-Series Analytics")
+ts_interval = st.selectbox("Time Interval", [5, 10, 15, 30], index=0, help="Group alerts by time intervals")
+ts_data, ts_err = fetch_json("/analytics/timeseries", params={"interval_minutes": ts_interval, "limit": 500})
+
+if ts_err:
+    st.warning(f"Time-series data unavailable: {ts_err}")
+elif ts_data:
+    # Alert Frequency Over Time
+    if ts_data.get("frequency"):
+        freq_df = pd.DataFrame(ts_data["frequency"])
+        if not freq_df.empty:
+            st.markdown("#### Alert Frequency Over Time")
+            freq_chart = freq_df[["time", "count"]].copy()
+            freq_chart = freq_chart.set_index("time")
+            st.line_chart(freq_chart)
+            st.caption(f"Alert count per {ts_interval}-minute interval")
+    
+    # Ports Over Time
+    if ts_data.get("ports"):
+        st.markdown("#### Top Destination Ports Over Time")
+        ports_df = pd.DataFrame(ts_data["ports"])
+        if not ports_df.empty:
+            # Flatten the ports data for visualization
+            ports_flat = []
+            for _, row in ports_df.iterrows():
+                time_val = row["time"]
+                for port_info in row["ports"]:
+                    ports_flat.append({
+                        "time": time_val,
+                        "port": port_info["port"],
+                        "count": port_info["count"]
+                    })
+            
+            if ports_flat:
+                ports_flat_df = pd.DataFrame(ports_flat)
+                ports_pivot = ports_flat_df.pivot(index="time", columns="port", values="count").fillna(0)
+                st.line_chart(ports_pivot)
+                st.caption(f"Port activity per {ts_interval}-minute interval")
+    
+    # IPs Over Time
+    if ts_data.get("ips"):
+        st.markdown("#### Top Source IPs Over Time")
+        ips_df = pd.DataFrame(ts_data["ips"])
+        if not ips_df.empty:
+            # Flatten the IPs data for visualization
+            ips_flat = []
+            for _, row in ips_df.iterrows():
+                time_val = row["time"]
+                for ip_info in row["ips"]:
+                    ips_flat.append({
+                        "time": time_val,
+                        "ip": ip_info["ip"],
+                        "count": ip_info["count"]
+                    })
+            
+            if ips_flat:
+                ips_flat_df = pd.DataFrame(ips_flat)
+                # Show top 5 IPs to avoid clutter
+                top_ips = ips_flat_df.groupby("ip")["count"].sum().nlargest(5).index.tolist()
+                ips_filtered = ips_flat_df[ips_flat_df["ip"].isin(top_ips)]
+                if not ips_filtered.empty:
+                    ips_pivot = ips_filtered.pivot(index="time", columns="ip", values="count").fillna(0)
+                    st.line_chart(ips_pivot)
+                    st.caption(f"Top source IPs activity per {ts_interval}-minute interval")
+else:
+    st.info("No time-series data available yet.")
 
 # Threat Intelligence Section
 st.divider()
@@ -376,7 +518,42 @@ with ti_tab2:
             st.markdown("#### Country Distribution")
             top_countries = country_df.head(10)
             st.bar_chart(top_countries.set_index("Country")[["Alert Count"]])
-            st.info("💡 For an interactive world map, install plotly or folium")
+            
+            # Geo-heatmap using plotly
+            try:
+                import plotly.express as px
+                
+                # Prepare data for map
+                map_data = []
+                for country_code, stats in countries.items():
+                    map_data.append({
+                        "country": stats.get("name", country_code),
+                        "code": country_code,
+                        "alert_count": stats.get("alert_count", 0),
+                        "unique_ips": stats.get("unique_ips", 0)
+                    })
+                
+                if map_data:
+                    map_df = pd.DataFrame(map_data)
+                    
+                    # Create choropleth map
+                    fig = px.choropleth(
+                        map_df,
+                        locations="code",
+                        color="alert_count",
+                        hover_name="country",
+                        hover_data={"alert_count": True, "unique_ips": True, "code": False},
+                        color_continuous_scale="Reds",
+                        title="🌍 Attack Source Heatmap - Alert Count by Country",
+                        labels={"alert_count": "Alert Count", "code": "Country Code"}
+                    )
+                    fig.update_geos(projection_type="natural earth")
+                    fig.update_layout(height=500)
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.info("💡 Hover over countries to see alert counts and unique IPs")
+            except ImportError:
+                st.info("💡 For an interactive world map, install plotly: `pip install plotly`")
         else:
             st.info("No geographic data available yet.")
     else:

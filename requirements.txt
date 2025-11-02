@@ -13,3 +13,4 @@ maxminddb
 geoip2
 ipwhois
 pycountry
+plotly
