@@ -33,6 +33,87 @@ if st.sidebar.button("Reset session stats"):
     st.session_state.pop("last_seen_row_id", None)
     st.success("Session stats reset. The table will recompute on next refresh.")
 
+# SOC Assistant Chat
+st.sidebar.divider()
+st.sidebar.header("🤖 SOC Assistant")
+st.sidebar.caption("Ask questions about alerts, analyze patterns, or get insights")
+
+# Initialize chat history
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# Display chat history
+with st.sidebar.expander("💬 Chat", expanded=False):
+    chat_container = st.container()
+    with chat_container:
+        # Show chat messages
+        for msg in st.session_state.chat_history:
+            if msg["role"] == "user":
+                st.chat_message("user").write(msg["content"])
+            elif msg["role"] == "assistant":
+                st.chat_message("assistant").write(msg["content"])
+
+        # Chat input
+        user_query = st.text_input(
+            "Ask a question...",
+            key="chat_input",
+            placeholder='e.g., "Show alerts from Russia" or "Why is port 22 risky?"'
+        )
+
+        if user_query:
+            # Add user message to history
+            st.session_state.chat_history.append({"role": "user", "content": user_query})
+
+            # Show user message immediately
+            st.chat_message("user").write(user_query)
+
+            # Get assistant response from backend
+            with st.spinner("🤖 Thinking..."):
+                try:
+                    chat_data = {
+                        "query": user_query,
+                        "history": st.session_state.chat_history[:-1]
+                    }
+
+                    # Call POST endpoint
+                    response_obj = requests.post(
+                        f"{API_BASE}/chat/query",
+                        json=chat_data,
+                        timeout=15
+                    )
+
+                    if response_obj.status_code == 200:
+                        response_data = response_obj.json()
+                        response = response_data.get("response", "I'm processing your query...")
+                        relevant_alerts = response_data.get("relevant_alerts", [])
+                    else:
+                        response = f"⚠️ Error: Backend returned status {response_obj.status_code}. Chat functionality may be unavailable."
+                        relevant_alerts = []
+
+                    st.session_state.chat_history.append({"role": "assistant", "content": response})
+                    st.chat_message("assistant").write(response)
+
+                    # Show relevant alerts if any
+                    if relevant_alerts:
+                        with st.expander(f"📋 Related Alerts ({len(relevant_alerts)})"):
+                            alerts_df = pd.DataFrame(relevant_alerts)
+                            if not alerts_df.empty:
+                                display_cols = ["row_id", "src_ip", "dst_port", "protocol", "y_prob", "mitre_tags"]
+                                display_cols = [c for c in display_cols if c in alerts_df.columns]
+                                st.dataframe(alerts_df[display_cols], use_container_width=True)
+
+                except Exception as e:
+                    error_msg = f"⚠️ Error: {str(e)}. Chat functionality is still being set up."
+                    st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
+                    st.chat_message("assistant").write(error_msg)
+
+                st.rerun()
+
+        # Clear chat button
+        if st.button("🗑️ Clear Chat", use_container_width=True):
+            st.session_state.chat_history = []
+            st.rerun()
+
 
 # ---------------- data fetch helpers ----------------
 def fetch_json(path: str, params=None):
@@ -225,7 +306,7 @@ with tab3:
                     ],
                     use_container_width=True,
                 )
-            
+
             # SHAP-like Feature Importance
             st.markdown("---")
             st.markdown("#### 🔍 Feature Importance (SHAP-like Explanation)")
@@ -236,7 +317,7 @@ with tab3:
                 # Display feature importance as bars
                 if feature_data.get("features"):
                     features = feature_data["features"]
-                    
+
                     # Create a DataFrame for visualization
                     feature_list = []
                     for feat_name, feat_info in features.items():
@@ -246,28 +327,243 @@ with tab3:
                             "Value": str(feat_info.get("value", "")),
                             "Impact": feat_info.get("impact", "neutral")
                         })
-                    
+
                     if feature_list:
                         feat_df = pd.DataFrame(feature_list)
                         feat_df = feat_df.sort_values("Importance", ascending=True)
-                        
+
                         # Show as horizontal bar chart
                         st.bar_chart(feat_df.set_index("Feature")[["Importance"]])
-                        
+
                         # Show detailed explanations
                         if feature_data.get("explanations"):
                             st.markdown("**Detailed Explanations:**")
                             for explanation in feature_data["explanations"]:
                                 st.write(f"- {explanation}")
-                        
+
                         st.caption(
                             f"Total explainable: {feature_data.get('total_feature_importance', 0):.1%} | "
                             f"Base threat probability: {feature_data.get('y_prob', 0):.1%}"
                         )
 
-# Analytics & Explainability Section
+
+# Daily SOC Summary Report Section
 st.divider()
-st.subheader("📊 Analytics & Explainability")
+st.subheader("📋 Daily SOC Summary Report")
+
+# Daily Summary Report
+summary_date = st.date_input("Report Date", value=None, help="Select date for report (defaults to today)")
+if summary_date:
+    date_str = summary_date.strftime("%Y-%m-%d")
+else:
+    date_str = None
+
+summary_report_data, summary_report_err = fetch_json(
+    "/reports/daily-summary",
+    params={"date": date_str, "limit": 2000}
+)
+
+if summary_report_err:
+    st.warning(f"Daily summary unavailable: {summary_report_err}")
+elif summary_report_data:
+    # Show LLM-enhanced indicator
+    if summary_report_data.get("llm_enhanced"):
+        st.success("🤖 AI-Generated Daily Summary Report")
+
+    # Display natural language report
+    st.markdown("### 📝 Executive Summary")
+    report_text = summary_report_data.get("report", "")
+    st.markdown(report_text)
+
+    # Show statistics
+    stats = summary_report_data.get("statistics", {})
+    if stats:
+        st.markdown("### 📊 Key Statistics")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Alerts", stats.get("total_alerts", 0))
+        with col2:
+            st.metric("High-Risk Alerts", stats.get("high_risk_alerts", 0))
+        with col3:
+            st.metric("Unique Source IPs", stats.get("unique_source_ips", 0))
+        with col4:
+            st.metric("Unique Ports", stats.get("unique_destination_ports", 0))
+
+    # Show embedded charts
+    charts = summary_report_data.get("charts", {})
+    if charts:
+        st.markdown("### 📈 Visual Analytics")
+
+        chart_tab1, chart_tab2, chart_tab3 = st.tabs(["Top Patterns", "Geographic", "Time Distribution"])
+
+        with chart_tab1:
+            # Top IPs
+            if charts.get("top_source_ips"):
+                st.markdown("#### Top Source IPs")
+                ips_df = pd.DataFrame(charts["top_source_ips"])
+                ips_df = ips_df.set_index("ip")
+                st.bar_chart(ips_df[["count"]])
+
+            # Top Ports
+            if charts.get("top_destination_ports"):
+                st.markdown("#### Top Destination Ports")
+                ports_df = pd.DataFrame(charts["top_destination_ports"])
+                ports_df = ports_df.set_index("port")
+                st.bar_chart(ports_df[["count"]])
+
+            # MITRE Techniques
+            if charts.get("mitre_techniques"):
+                st.markdown("#### MITRE Techniques Distribution")
+                mitre_df = pd.DataFrame(charts["mitre_techniques"])
+                mitre_df = mitre_df.set_index("technique")
+                st.bar_chart(mitre_df[["count"]])
+
+        with chart_tab2:
+            # Geographic distribution
+            if charts.get("geographic_distribution"):
+                st.markdown("#### Attack Origins by Country")
+                geo_df = pd.DataFrame(charts["geographic_distribution"])
+                geo_df = geo_df.set_index("country")
+                st.bar_chart(geo_df[["count"]])
+            else:
+                st.info("Geographic data not available. Enable threat intelligence enrichment for country data.")
+
+        with chart_tab3:
+            # Hourly distribution
+            if charts.get("hourly_distribution"):
+                st.markdown("#### Attack Frequency by Hour")
+                hourly_df = pd.DataFrame(charts["hourly_distribution"])
+                hourly_df = hourly_df.set_index("hour")
+                st.line_chart(hourly_df[["count"]])
+            else:
+                st.info("Hourly distribution data not available.")
+
+    st.caption(
+        f"Report Date: {summary_report_data.get('date', 'N/A')} | "
+        f"Alerts Analyzed: {summary_report_data.get('alerts_analyzed', 0)}"
+    )
+else:
+    st.info("Daily summary report unavailable. Ensure there are enough alerts for analysis.")
+
+# Attack Replay Simulation Section
+st.divider()
+st.subheader("🎬 Attack Replay Simulation")
+
+st.markdown("### 🔍 Simulate Unprotected Port Scenario")
+st.caption("See what would happen if a specific port wasn't protected - based on historical attack patterns")
+
+col1, col2 = st.columns(2)
+with col1:
+    sim_port = st.number_input(
+        "Port to Simulate",
+        min_value=1,
+        max_value=65535,
+        value=22,
+        step=1,
+        help="Port number to simulate as unprotected"
+    )
+with col2:
+    sim_duration = st.number_input(
+        "Simulation Duration (hours)",
+        min_value=1,
+        max_value=168,
+        value=24,
+        step=1
+    )
+
+if st.button("🚀 Run Simulation", type="primary", use_container_width=True):
+    with st.spinner("Running attack replay simulation..."):
+        sim_data, sim_err = fetch_json(
+            "/simulation/replay",
+            params={"port": sim_port, "duration_hours": sim_duration, "limit": 1000}
+        )
+
+        if sim_err:
+            st.error(f"Simulation failed: {sim_err}")
+        elif sim_data:
+            st.session_state["simulation_result"] = sim_data
+            st.rerun()
+
+# Display simulation results
+if "simulation_result" in st.session_state:
+    sim_data = st.session_state["simulation_result"]
+
+    # Risk Assessment
+    risk_assessment = sim_data.get("risk_assessment", {})
+    risk_level = risk_assessment.get("risk_level", "unknown")
+
+    if risk_level == "critical":
+        st.error(f"🚨 **CRITICAL RISK** - Port {sim_data.get('port', 'N/A')}")
+    elif risk_level == "high":
+        st.warning(f"⚠️ **HIGH RISK** - Port {sim_data.get('port', 'N/A')}")
+    elif risk_level == "medium":
+        st.warning(f"⚠️ **MEDIUM RISK** - Port {sim_data.get('port', 'N/A')}")
+    else:
+        st.info(f"ℹ️ **LOW RISK** - Port {sim_data.get('port', 'N/A')}")
+
+    st.markdown(f"**Risk Score:** {risk_assessment.get('risk_score', 0):.2%}")
+    st.info(risk_assessment.get("recommendation", "No recommendation available"))
+
+    # Impact Analysis
+    impact = sim_data.get("impact_analysis", {})
+    if impact:
+        st.markdown("### 📊 Impact Analysis")
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Historical Attacks", impact.get("historical_attacks", 0))
+        with col2:
+            st.metric("Projected Attacks", impact.get("projected_attacks", 0), delta=f"over {sim_data.get('duration_hours', 24)}h")
+        with col3:
+            st.metric("Projected Data Exfil", f"{impact.get('projected_data_exfil_gb', 0)} GB")
+        with col4:
+            st.metric("Unique Attackers", impact.get("unique_attackers", 0))
+
+        # Show top attackers
+        if impact.get("top_attackers"):
+            st.markdown("#### Top Attackers (if port unprotected)")
+            attackers_df = pd.DataFrame(impact["top_attackers"])
+            attackers_df = attackers_df.set_index("ip")
+            st.bar_chart(attackers_df[["count"]])
+
+        # Show MITRE techniques
+        if impact.get("mitre_techniques"):
+            st.markdown("#### MITRE Techniques Expected")
+            mitre_list = []
+            for tech in impact["mitre_techniques"]:
+                mitre_list.append({
+                    "Technique": tech.get("technique", "N/A"),
+                    "Expected Occurrences": tech.get("count", 0)
+                })
+            if mitre_list:
+                mitre_df = pd.DataFrame(mitre_list)
+                st.dataframe(mitre_df, use_container_width=True)
+
+    # Simulated Attacks
+    simulated_attacks = sim_data.get("simulated_attacks", [])
+    if simulated_attacks:
+        st.markdown("### 🎯 Simulated Attack Examples")
+        st.caption(f"Examples of what could happen if port {sim_data.get('port', 'N/A')} was unprotected")
+
+        sim_list = []
+        for attack in simulated_attacks[:20]:
+            sim_list.append({
+                "Alert ID": attack.get("row_id", "N/A"),
+                "Source IP": attack.get("src_ip", "N/A"),
+                "Protocol": attack.get("protocol", "N/A"),
+                "Threat Prob": f"{attack.get('threat_probability', 0):.1%}",
+                "Impact": attack.get("simulated_impact", "Unknown"),
+                "Packets/s": f"{attack.get('packets_per_sec', 0):.0f}",
+                "Bytes/s": f"{attack.get('bytes_per_sec', 0):.0f}",
+                "MITRE": ", ".join(attack.get("mitre_tags", []))
+            })
+
+        if sim_list:
+            sim_df = pd.DataFrame(sim_list)
+            st.dataframe(sim_df, use_container_width=True, height=400)
+
+    st.caption(sim_data.get("message", "Simulation complete"))
+
 
 # Top MITRE Techniques
 st.markdown("### 🎯 Top 5 MITRE Techniques Observed Today")

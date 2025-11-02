@@ -8,8 +8,9 @@ import json
 import random
 import os
 import csv
+import requests
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # AI/ML imports (optional - will fail gracefully if not installed)
 try:
@@ -23,10 +24,13 @@ try:
     from sentence_transformers import SentenceTransformer
     import numpy as np
     from sklearn.cluster import DBSCAN
+    from sklearn.ensemble import IsolationForest
     EMBEDDINGS_AVAILABLE = True
+    ANOMALY_DETECTION_AVAILABLE = True
 except ImportError:
     EMBEDDINGS_AVAILABLE = False
-    print("Warning: sentence-transformers/scikit-learn not installed. Clustering features disabled.")
+    ANOMALY_DETECTION_AVAILABLE = False
+    print("Warning: sentence-transformers/scikit-learn not installed. Clustering and anomaly detection features disabled.")
 
 # Threat Intelligence imports (optional - will fail gracefully if not installed)
 try:
@@ -1510,4 +1514,933 @@ def explain_alert_features(alert_id: int):
         "remaining_score": round(max(0, y_prob - total_explained), 3),
         "interpretation": f"This alert was flagged with {y_prob:.1%} threat probability. "
                          f"The key factors contributing to this score are explained above."
+    }
+
+
+# -------- SOC Assistant Chat Endpoints --------
+
+@app.post("/chat/query")
+def chat_query(query: str = Body(..., embed=True), history: List[Dict] = Body(default=[], embed=True)):
+    """
+    Process a chat query from the SOC Assistant.
+    Uses RAG to retrieve relevant alerts and context, then generates a response.
+    """
+    if not query:
+        return {"response": "Please provide a query.", "relevant_alerts": []}
+    
+    # Step 1: Parse query and retrieve relevant alerts (RAG)
+    relevant_alerts = _retrieve_relevant_alerts(query)
+    
+    # Step 2: Generate response using LLM with context
+    response = _generate_chat_response(query, relevant_alerts, history)
+    
+    return {
+        "response": response,
+        "relevant_alerts": relevant_alerts[:5],  # Return top 5 relevant alerts
+        "query": query
+    }
+
+
+def _retrieve_relevant_alerts(query: str, limit: int = 10) -> List[dict]:
+    """
+    Retrieve relevant alerts based on the query using keyword matching and intent detection.
+    This is a simple RAG implementation - can be enhanced with embeddings.
+    """
+    if not ALERTS:
+        return []
+    
+    query_lower = query.lower()
+    
+    # Detect intent for direct alert retrieval queries
+    show_intents = ["show", "list", "get", "display", "fetch", "give me", "retrieve"]
+    alert_intents = ["alert", "alerts", "events", "incident", "incidents"]
+    time_intents = ["previous", "last", "recent", "latest", "new", "recently", "newest"]
+    
+    is_show_query = any(intent in query_lower for intent in show_intents)
+    is_alert_query = any(intent in query_lower for intent in alert_intents)
+    is_time_query = any(intent in query_lower for intent in time_intents)
+    
+    # Extract number from query (e.g., "10 alerts", "previous 5")
+    import re
+    numbers = re.findall(r'\d+', query)
+    requested_count = int(numbers[0]) if numbers else limit
+    
+    # If it's a "show alerts" query, directly return recent alerts
+    if is_show_query and is_alert_query:
+        # Get requested number of alerts (or default to limit)
+        count = min(requested_count, 100)  # Cap at 100 for performance
+        
+        # Return most recent alerts sorted by row_id
+        sorted_alerts = sorted(ALERTS, key=lambda x: int(x.get("row_id", 0)))
+        return sorted_alerts[-count:] if len(sorted_alerts) > count else sorted_alerts
+    
+    # If it's a time-based query (previous/recent/last), return recent alerts
+    if is_time_query and is_alert_query:
+        count = min(requested_count if numbers else 10, 100)
+        sorted_alerts = sorted(ALERTS, key=lambda x: int(x.get("row_id", 0)))
+        return sorted_alerts[-count:] if len(sorted_alerts) > count else sorted_alerts
+    
+    # Otherwise, use keyword-based search
+    scored_alerts = []
+    
+    for alert in ALERTS[-500:]:  # Search recent 500 alerts
+        score = 0
+        
+        # Check source IP
+        src_ip = str(alert.get("src_ip", "")).lower()
+        if src_ip and src_ip in query_lower:
+            score += 10
+        
+        # Check destination port
+        dst_port = str(alert.get("dst_port", ""))
+        if dst_port and dst_port in query:
+            score += 8
+        
+        # Check protocol
+        protocol = str(alert.get("protocol", "")).lower()
+        if protocol and protocol in query_lower:
+            score += 5
+        
+        # Check MITRE tags
+        mitre_tags = alert.get("mitre_tags", [])
+        if isinstance(mitre_tags, list):
+            for tag in mitre_tags:
+                if tag and tag.lower() in query_lower:
+                    score += 10
+        
+        # Check country (if available)
+        if "src_ip_country" in alert:
+            country = str(alert.get("src_ip_country", "")).lower()
+            country_keywords = ["russia", "china", "usa", "uk", "germany", "france"]
+            for keyword in country_keywords:
+                if keyword in query_lower and keyword in country:
+                    score += 15
+        
+        # Check time-related keywords
+        if any(word in query_lower for word in ["last hour", "recent", "new", "today"]):
+            # Prioritize recent alerts
+            row_id = alert.get("row_id", 0)
+            if row_id > len(ALERTS) - 50:
+                score += 5
+        
+        # Check port-specific queries
+        port_keywords = {
+            "22": ["ssh", "22", "port 22"],
+            "80": ["http", "80", "port 80", "web"],
+            "443": ["https", "443", "ssl", "tls"],
+            "3389": ["rdp", "remote desktop", "3389"]
+        }
+        for port, keywords in port_keywords.items():
+            if any(kw in query_lower for kw in keywords):
+                if str(alert.get("dst_port", "")) == port:
+                    score += 12
+        
+        if score > 0:
+            scored_alerts.append((score, alert))
+    
+    # Sort by score and return top alerts
+    scored_alerts.sort(key=lambda x: x[0], reverse=True)
+    return [alert for _, alert in scored_alerts[:limit]]
+
+
+def _generate_chat_response(query: str, relevant_alerts: List[dict], history: List[Dict]) -> str:
+    """
+    Generate a chat response using LLM with RAG context.
+    Falls back to rule-based responses if LLM is not available.
+    """
+    # Build context from relevant alerts
+    context = ""
+    if relevant_alerts:
+        context = "\n\nRelevant Alerts:\n"
+        for i, alert in enumerate(relevant_alerts[:5], 1):
+            context += f"{i}. Alert {alert.get('row_id', 'N/A')}: "
+            context += f"Source: {alert.get('src_ip', 'N/A')}, "
+            context += f"Port: {alert.get('dst_port', 'N/A')}, "
+            context += f"Protocol: {alert.get('protocol', 'N/A')}, "
+            context += f"MITRE: {', '.join(alert.get('mitre_tags', []))}, "
+            context += f"Threat: {alert.get('y_prob', 0):.1%}\n"
+    
+    # Try LLM first (OpenAI)
+    client = get_openai_client()
+    if client and OPENAI_AVAILABLE:
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a SOC (Security Operations Center) Assistant. Help analysts understand security alerts, identify threats, and answer questions about network security events. Use the provided alert context to give accurate, actionable answers."
+                }
+            ]
+            
+            # Add chat history
+            for msg in history[-5:]:  # Last 5 messages for context
+                messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+            
+            # Add current query with context
+            user_message = f"Query: {query}\n\n{context}" if context else query
+            messages.append({"role": "user", "content": user_message})
+            
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                max_tokens=500,
+                temperature=0.7
+            )
+            
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"LLM chat error: {e}")
+            # Fall through to rule-based
+    
+    # Rule-based fallback responses
+    query_lower = query.lower()
+    
+    # Port explanations
+    if "port 22" in query_lower or "ssh" in query_lower or "22" in query_lower:
+        return f"⚠️ **Port 22 (SSH) is risky** because it's commonly targeted for brute-force attacks and unauthorized access attempts. {context if context else 'I found ' + str(len(relevant_alerts)) + ' relevant alerts related to port 22.'}"
+    
+    # Country-based queries
+    country_queries = ["russia", "china", "usa", "uk", "germany", "france"]
+    for country in country_queries:
+        if country in query_lower:
+            count = len([a for a in relevant_alerts if country in str(a.get("src_ip_country", "")).lower()])
+            return f"📍 I found **{count} alerts** from {country.capitalize()}. {context if count > 0 else 'No recent alerts found from this country.'}"
+    
+    # Summary queries
+    if any(word in query_lower for word in ["summary", "summarize", "overview"]):
+        total_alerts = len(ALERTS)
+        recent = ALERTS[-100:] if len(ALERTS) > 100 else ALERTS
+        return f"📊 **Summary**: {total_alerts} total alerts in system. Recent activity: {len(recent)} alerts analyzed. {context if relevant_alerts else 'No specific patterns identified.'}"
+    
+    # Handle "show alerts" queries
+    show_intents = ["show", "list", "get", "display", "fetch", "give me", "retrieve"]
+    alert_intents = ["alert", "alerts", "events", "incident", "incidents"]
+    query_lower = query.lower()
+    
+    if any(intent in query_lower for intent in show_intents) and any(intent in query_lower for intent in alert_intents):
+        if relevant_alerts:
+            return f"📋 Here are **{len(relevant_alerts)} alerts** you requested:\n\n{context if context else 'These are the most recent alerts in the system.'}"
+        else:
+            return f"📋 I couldn't find any alerts matching your criteria. There are **{len(ALERTS)} total alerts** in the system. Try asking for 'recent alerts' or 'last N alerts'."
+    
+    # Generic response
+    return f"🤖 I understand you're asking about: '{query}'. {context if relevant_alerts else 'I found ' + str(len(relevant_alerts)) + ' relevant alerts. Let me analyze them for you.'}"
+
+
+# -------- Anomaly Detection & Predictive Analytics --------
+
+@app.get("/analytics/anomalies")
+def detect_anomalies(
+    window_minutes: int = Query(30, ge=5, le=1440, description="Time window in minutes for analysis"),
+    limit: int = Query(500, ge=50, le=5000, description="Number of recent alerts to analyze")
+):
+    """
+    Detect anomalies in alert patterns using Isolation Forest.
+    Flags unexpected traffic spikes, unusual patterns, and outliers.
+    """
+    if not ALERTS or len(ALERTS) < 10:
+        return {
+            "anomalies": [],
+            "total_analyzed": 0,
+            "anomaly_count": 0,
+            "anomaly_rate": 0.0,
+            "message": "Insufficient alerts for anomaly detection"
+        }
+    
+    if not ANOMALY_DETECTION_AVAILABLE:
+        return {
+            "anomalies": [],
+            "total_analyzed": 0,
+            "anomaly_count": 0,
+            "anomaly_rate": 0.0,
+            "message": "Anomaly detection requires scikit-learn. Install with: pip install scikit-learn"
+        }
+    
+    # Get recent alerts
+    recent_alerts = sorted(ALERTS, key=lambda x: int(x.get("row_id", 0)))[-limit:]
+    
+    if len(recent_alerts) < 10:
+        return {
+            "anomalies": [],
+            "total_analyzed": len(recent_alerts),
+            "anomaly_count": 0,
+            "anomaly_rate": 0.0,
+            "message": "Need at least 10 alerts for anomaly detection"
+        }
+    
+    # Prepare features for anomaly detection
+    features = []
+    alert_ids = []
+    
+    for alert in recent_alerts:
+        # Extract numerical features
+        feature_vector = [
+            float(alert.get("dst_port", 0)),
+            float(alert.get("approx_packets_per_s", 0)),
+            float(alert.get("approx_bytes_per_s", 0)),
+            float(alert.get("y_prob", 0)),
+            len(alert.get("mitre_tags", [])),  # Number of MITRE tags
+            int(alert.get("row_id", 0)) % 1000  # Pattern indicator
+        ]
+        features.append(feature_vector)
+        alert_ids.append(alert.get("row_id", 0))
+    
+    features = np.array(features)
+    
+    # Train Isolation Forest
+    try:
+        # Contamination: expected proportion of anomalies (auto-detect if not specified)
+        contamination = min(0.2, max(0.01, 5.0 / len(recent_alerts)))
+        
+        iso_forest = IsolationForest(
+            contamination=contamination,
+            random_state=42,
+            n_estimators=100
+        )
+        
+        # Fit and predict
+        anomaly_labels = iso_forest.fit_predict(features)
+        anomaly_scores = iso_forest.score_samples(features)
+        
+        # Identify anomalies (label == -1)
+        anomalies = []
+        for idx, (alert, label, score) in enumerate(zip(recent_alerts, anomaly_labels, anomaly_scores)):
+            if label == -1:  # Anomaly detected
+                anomalies.append({
+                    "alert": alert,
+                    "anomaly_score": float(score),
+                    "row_id": alert.get("row_id", 0),
+                    "reason": _explain_anomaly(alert, recent_alerts)
+                })
+        
+        # Sort by anomaly score (most anomalous first)
+        anomalies.sort(key=lambda x: x["anomaly_score"])
+        
+        # Calculate statistics
+        total_analyzed = len(recent_alerts)
+        anomaly_count = len(anomalies)
+        anomaly_rate = (anomaly_count / total_analyzed) * 100 if total_analyzed > 0 else 0
+        
+        return {
+            "anomalies": anomalies[:50],  # Return top 50 anomalies
+            "total_analyzed": total_analyzed,
+            "anomaly_count": anomaly_count,
+            "anomaly_rate": round(anomaly_rate, 2),
+            "window_minutes": window_minutes,
+            "message": f"Detected {anomaly_count} anomalies ({anomaly_rate:.1f}%) in {total_analyzed} alerts"
+        }
+    
+    except Exception as e:
+        return {
+            "anomalies": [],
+            "total_analyzed": len(recent_alerts),
+            "anomaly_count": 0,
+            "anomaly_rate": 0.0,
+            "message": f"Anomaly detection error: {str(e)}"
+        }
+
+
+def _explain_anomaly(alert: dict, all_alerts: List[dict]) -> str:
+    """Generate human-readable explanation for why an alert is anomalous."""
+    reasons = []
+    
+    # Check if port is unusual
+    dst_port = alert.get("dst_port", 0)
+    port_counts = Counter(a.get("dst_port", 0) for a in all_alerts)
+    if port_counts.get(dst_port, 0) < len(all_alerts) * 0.05:  # Less than 5% of alerts
+        reasons.append(f"unusual port {dst_port}")
+    
+    # Check if packet rate is very high
+    pps = alert.get("approx_packets_per_s", 0)
+    avg_pps = np.mean([a.get("approx_packets_per_s", 0) for a in all_alerts])
+    if pps > avg_pps * 3:
+        reasons.append("unusually high packet rate")
+    
+    # Check if byte rate is very high
+    bps = alert.get("approx_bytes_per_s", 0)
+    avg_bps = np.mean([a.get("approx_bytes_per_s", 0) for a in all_alerts])
+    if bps > avg_bps * 3:
+        reasons.append("unusually high bandwidth")
+    
+    # Check if threat probability is unusually high
+    y_prob = alert.get("y_prob", 0)
+    avg_prob = np.mean([a.get("y_prob", 0) for a in all_alerts])
+    if y_prob > avg_prob + 0.3:
+        reasons.append("high threat probability")
+    
+    # Check for unusual MITRE tags
+    mitre_tags = alert.get("mitre_tags", [])
+    if len(mitre_tags) > 2:
+        reasons.append("multiple MITRE techniques")
+    
+    return ", ".join(reasons) if reasons else "statistical outlier"
+
+
+@app.get("/analytics/forecast")
+def forecast_attacks(
+    period: str = Query("hour", regex="^(hour|day|week)$", description="Forecast period: hour, day, or week"),
+    periods_ahead: int = Query(24, ge=1, le=168, description="Number of periods to forecast ahead"),
+    limit: int = Query(1000, ge=100, le=10000, description="Number of recent alerts to analyze")
+):
+    """
+    Forecast attack frequency per hour/day/week using time series analysis.
+    Predicts future attack peaks based on historical patterns.
+    """
+    if not ALERTS or len(ALERTS) < 50:
+        return {
+            "forecast": [],
+            "historical": [],
+            "period": period,
+            "periods_ahead": periods_ahead,
+            "message": "Insufficient data for forecasting (need at least 50 alerts)"
+        }
+    
+    # Get recent alerts
+    recent_alerts = sorted(ALERTS, key=lambda x: int(x.get("row_id", 0)))[-limit:]
+    
+    # Group alerts by time period
+    period_data = defaultdict(int)
+    
+    for alert in recent_alerts:
+        timestamp_str = alert.get("timestamp")
+        if timestamp_str:
+            try:
+                if isinstance(timestamp_str, str):
+                    alert_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                else:
+                    alert_time = timestamp_str
+                
+                # Group by period
+                if period == "hour":
+                    period_key = alert_time.strftime("%Y-%m-%d %H:00")
+                    period_timestamp = alert_time.replace(minute=0, second=0, microsecond=0)
+                elif period == "day":
+                    period_key = alert_time.strftime("%Y-%m-%d")
+                    period_timestamp = alert_time.replace(hour=0, minute=0, second=0, microsecond=0)
+                else:  # week
+                    # Get start of week (Monday)
+                    days_since_monday = alert_time.weekday()
+                    period_timestamp = alert_time.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_monday)
+                    period_key = period_timestamp.strftime("%Y-W%U")
+                
+                period_data[period_key] += 1
+                
+            except Exception:
+                # Use row_id as fallback
+                row_id = alert.get("row_id", 0)
+                period_bucket = row_id // 30  # Approximate period bucket
+                period_key = f"period_{period_bucket}"
+                period_data[period_key] += 1
+    
+    # Sort by period
+    sorted_periods = sorted(period_data.items())
+    
+    # Calculate historical averages and trends
+    historical_values = [count for _, count in sorted_periods]
+    
+    if len(historical_values) < 3:
+        return {
+            "forecast": [],
+            "historical": [{"period": k, "count": v} for k, v in sorted_periods],
+            "period": period,
+            "periods_ahead": periods_ahead,
+            "message": "Need at least 3 periods for forecasting"
+        }
+    
+    # Simple forecasting using moving average and trend
+    avg = np.mean(historical_values[-10:]) if len(historical_values) >= 10 else np.mean(historical_values)
+    
+    # Calculate trend
+    if len(historical_values) >= 2:
+        recent_trend = np.mean(historical_values[-5:]) - np.mean(historical_values[-10:-5] if len(historical_values) >= 10 else historical_values[:-5])
+    else:
+        recent_trend = 0
+    
+    # Generate forecast
+    forecast = []
+    base_value = historical_values[-1] if historical_values else avg
+    
+    for i in range(1, periods_ahead + 1):
+        # Simple linear forecast with trend
+        forecasted_count = max(0, base_value + (recent_trend * i))
+        
+        # Add some smoothing
+        forecasted_count = forecasted_count * 0.7 + avg * 0.3
+        
+        # Round to integer
+        forecasted_count = int(round(forecasted_count))
+        
+        forecast.append({
+            "period": i,
+            "forecasted_count": forecasted_count,
+            "confidence": "medium" if len(historical_values) > 10 else "low"
+        })
+    
+    # Prepare historical data
+    historical = [{"period": k, "count": v} for k, v in sorted_periods[-20:]]  # Last 20 periods
+    
+    return {
+        "forecast": forecast,
+        "historical": historical,
+        "period": period,
+        "periods_ahead": periods_ahead,
+        "average_count": round(avg, 2),
+        "trend": round(recent_trend, 2),
+        "message": f"Forecasted {periods_ahead} {period}s ahead based on {len(historical_values)} historical periods"
+    }
+
+
+@app.get("/analytics/predict")
+def predict_next_attack(
+    limit: int = Query(200, ge=50, le=2000, description="Number of recent alerts to analyze for patterns"),
+    prediction_type: str = Query("port", regex="^(port|tactic|protocol)$", description="What to predict: port, tactic, or protocol")
+):
+    """
+    Predict next likely attack vector using historical sequence patterns.
+    Uses sequence analysis to predict likely next ports, tactics, or protocols.
+    """
+    if not ALERTS or len(ALERTS) < 20:
+        return {
+            "predictions": [],
+            "confidence": 0.0,
+            "prediction_type": prediction_type,
+            "message": "Insufficient data for prediction (need at least 20 alerts)"
+        }
+    
+    # Get recent alerts
+    recent_alerts = sorted(ALERTS, key=lambda x: int(x.get("row_id", 0)))[-limit:]
+    
+    if len(recent_alerts) < 20:
+        return {
+            "predictions": [],
+            "confidence": 0.0,
+            "prediction_type": prediction_type,
+            "message": "Need at least 20 alerts for sequence prediction"
+        }
+    
+    # Build sequences for prediction
+    sequences = []
+    
+    for alert in recent_alerts:
+        if prediction_type == "port":
+            value = str(alert.get("dst_port", ""))
+        elif prediction_type == "tactic":
+            mitre_tags = alert.get("mitre_tags", [])
+            value = mitre_tags[0] if mitre_tags else ""
+        else:  # protocol
+            value = str(alert.get("protocol", "")).upper()
+        
+        if value:
+            sequences.append(value)
+    
+    if not sequences:
+        return {
+            "predictions": [],
+            "confidence": 0.0,
+            "prediction_type": prediction_type,
+            "message": f"No {prediction_type} data found in alerts"
+        }
+    
+    # Analyze sequence patterns
+    predictions = []
+    
+    # Method 1: Most frequent next value after current patterns
+    transition_counts = defaultdict(lambda: Counter())
+    
+    # Look at sequences of 2-3 items to find patterns
+    for i in range(len(sequences) - 1):
+        current = sequences[i]
+        next_val = sequences[i + 1]
+        transition_counts[current][next_val] += 1
+    
+    # Also look at 2-item sequences
+    if len(sequences) >= 2:
+        for i in range(len(sequences) - 2):
+            pattern = f"{sequences[i]}-{sequences[i+1]}"
+            next_val = sequences[i + 2]
+            transition_counts[pattern][next_val] += 1
+    
+    # Get most recent value(s) to predict next
+    if len(sequences) >= 2:
+        # Last 2 values as context
+        context_2 = f"{sequences[-2]}-{sequences[-1]}"
+        context_1 = sequences[-1]
+    else:
+        context_1 = sequences[-1]
+        context_2 = None
+    
+    # Predict based on transitions
+    seen_predictions = set()
+    
+    # Try 2-item pattern first
+    if context_2 and context_2 in transition_counts:
+        transitions = transition_counts[context_2]
+        total_transitions = sum(transitions.values())
+        
+        for value, count in transitions.most_common(5):
+            if value not in seen_predictions and total_transitions > 0:
+                confidence = (count / total_transitions) * 100
+                predictions.append({
+                    "value": value,
+                    "confidence": round(confidence, 2),
+                    "pattern": context_2,
+                    "occurrences": count
+                })
+                seen_predictions.add(value)
+    
+    # Fallback to 1-item pattern
+    if context_1 and context_1 in transition_counts:
+        transitions = transition_counts[context_1]
+        total_transitions = sum(transitions.values())
+        
+        for value, count in transitions.most_common(5):
+            if value not in seen_predictions and total_transitions > 0:
+                confidence = (count / total_transitions) * 100
+                predictions.append({
+                    "value": value,
+                    "confidence": round(confidence, 2),
+                    "pattern": context_1,
+                    "occurrences": count
+                })
+                seen_predictions.add(value)
+    
+    # Fallback: Most frequent overall
+    if not predictions:
+        overall_counts = Counter(sequences)
+        for value, count in overall_counts.most_common(5):
+            confidence = (count / len(sequences)) * 100
+            predictions.append({
+                "value": value,
+                "confidence": round(confidence, 2),
+                "pattern": "overall_frequency",
+                "occurrences": count
+            })
+    
+    # Calculate overall confidence
+    overall_confidence = predictions[0]["confidence"] if predictions else 0.0
+    
+    return {
+        "predictions": predictions[:5],  # Top 5 predictions
+        "confidence": round(overall_confidence, 2),
+        "prediction_type": prediction_type,
+        "context": context_2 if context_2 else context_1,
+        "patterns_analyzed": len(transition_counts),
+        "message": f"Predicted next {prediction_type} based on {len(sequences)} alert sequences"
+    }
+
+
+# -------- Daily SOC Summary Reports --------
+
+@app.get("/reports/daily-summary")
+def daily_summary_report(
+    date: Optional[str] = Query(None, description="Date for report (YYYY-MM-DD). Defaults to today"),
+    limit: int = Query(2000, ge=100, le=10000, description="Number of alerts to analyze")
+):
+    """
+    Generate comprehensive daily SOC summary report with natural language analysis and chart data.
+    Includes: threat overview, top attack patterns, geographic analysis, and recommendations.
+    """
+    if not ALERTS or len(ALERTS) < 10:
+        return {
+            "report": "No alerts available for daily summary.",
+            "date": date or datetime.now().strftime("%Y-%m-%d"),
+            "charts": {},
+            "statistics": {},
+            "llm_enhanced": False
+        }
+    
+    # Get alerts for analysis
+    recent_alerts = sorted(ALERTS, key=lambda x: int(x.get("row_id", 0)))[-limit:]
+    
+    # Calculate statistics for charts
+    stats = {
+        "total_alerts": len(recent_alerts),
+        "high_risk_alerts": len([a for a in recent_alerts if float(a.get("y_prob", 0)) > 0.7]),
+        "unique_source_ips": len(set(a.get("src_ip", "") for a in recent_alerts if a.get("src_ip"))),
+        "unique_destination_ports": len(set(a.get("dst_port", 0) for a in recent_alerts)),
+        "total_bytes": sum(float(a.get("approx_bytes_per_s", 0)) for a in recent_alerts),
+        "avg_threat_probability": np.mean([float(a.get("y_prob", 0)) for a in recent_alerts]) if ANOMALY_DETECTION_AVAILABLE else 0.0
+    }
+    
+    # Top patterns for charts
+    top_ips = Counter(a.get("src_ip", "unknown") for a in recent_alerts).most_common(10)
+    top_ports = Counter(a.get("dst_port", 0) for a in recent_alerts).most_common(10)
+    top_protocols = Counter(a.get("protocol", "unknown") for a in recent_alerts).most_common(5)
+    top_mitre = Counter()
+    for a in recent_alerts:
+        tags = a.get("mitre_tags", [])
+        if isinstance(tags, list):
+            top_mitre.update(tags)
+    top_mitre = top_mitre.most_common(5)
+    
+    # Geographic distribution (if available)
+    countries = Counter()
+    for a in recent_alerts:
+        if "src_ip_country" in a:
+            country = a.get("src_ip_country", "unknown")
+            if country != "unknown":
+                countries[country] += 1
+    
+    # Time distribution (by hour if timestamps available)
+    hourly_distribution = Counter()
+    for a in recent_alerts:
+        timestamp_str = a.get("timestamp")
+        if timestamp_str:
+            try:
+                if isinstance(timestamp_str, str):
+                    alert_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                    hour = alert_time.hour
+                    hourly_distribution[hour] += 1
+            except:
+                pass
+    
+    # Prepare chart data
+    charts = {
+        "top_source_ips": [{"ip": ip, "count": count} for ip, count in top_ips],
+        "top_destination_ports": [{"port": port, "count": count} for port, count in top_ports],
+        "protocol_distribution": [{"protocol": proto, "count": count} for proto, count in top_protocols],
+        "mitre_techniques": [{"technique": tech, "count": count} for tech, count in top_mitre],
+        "geographic_distribution": [{"country": country, "count": count} for country, count in countries.most_common(10)],
+        "hourly_distribution": [{"hour": hour, "count": count} for hour, count in sorted(hourly_distribution.items())]
+    }
+    
+    # Generate natural language report using LLM
+    report_text = _generate_daily_summary_report(recent_alerts, stats, charts)
+    
+    # Calculate trends (compare with previous day if possible)
+    trends = {
+        "alert_trend": "stable",  # Could be enhanced with historical comparison
+        "risk_trend": "stable",
+        "top_threat": top_mitre[0][0] if top_mitre else "Unknown"
+    }
+    
+    return {
+        "report": report_text,
+        "date": date or datetime.now().strftime("%Y-%m-%d"),
+        "statistics": stats,
+        "charts": charts,
+        "trends": trends,
+        "llm_enhanced": True,
+        "alerts_analyzed": len(recent_alerts)
+    }
+
+
+def _generate_daily_summary_report(alerts: List[dict], stats: Dict, charts: Dict) -> str:
+    """Generate comprehensive daily SOC summary report using LLM."""
+    client = get_openai_client()
+    
+    # Extract key insights
+    top_ips = charts.get("top_source_ips", [])[:5]
+    top_ports = charts.get("top_destination_ports", [])[:5]
+    top_mitre = charts.get("mitre_techniques", [])[:5]
+    
+    # Build comprehensive prompt
+    prompt = f"""Generate a comprehensive daily SOC (Security Operations Center) summary report for {stats.get('total_alerts', 0)} alerts analyzed.
+
+KEY STATISTICS:
+- Total Alerts: {stats.get('total_alerts', 0)}
+- High-Risk Alerts: {stats.get('high_risk_alerts', 0)}
+- Unique Source IPs: {stats.get('unique_source_ips', 0)}
+- Unique Destination Ports: {stats.get('unique_destination_ports', 0)}
+- Average Threat Probability: {stats.get('avg_threat_probability', 0):.1%}
+
+TOP THREAT PATTERNS:
+- Top Source IPs: {', '.join(f'{ip["ip"]} ({ip["count"]} alerts)' for ip in top_ips)}
+- Top Targeted Ports: {', '.join(f'Port {p["port"]} ({p["count"]} alerts)' for p in top_ports)}
+- Top MITRE Techniques: {', '.join(f'{t["technique"]} ({t["count"]} occurrences)' for t in top_mitre)}
+
+Write a professional 4-6 paragraph daily SOC summary report covering:
+1. Executive summary of the day's threat landscape
+2. Key attack patterns and trends observed
+3. Notable security events and high-risk alerts
+4. Geographic distribution of attacks (if available)
+5. Recommendations for security improvements
+
+Format: Natural language, professional tone, actionable insights."""
+    
+    if client and OPENAI_AVAILABLE:
+        try:
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a senior SOC analyst writing comprehensive daily security summary reports for executives and security teams."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=800,
+                temperature=0.7
+            )
+            
+            return response.choices[0].message.content.strip()
+        
+        except Exception as e:
+            print(f"LLM daily report generation failed: {e}")
+            # Fall through to rule-based
+    
+    # Rule-based fallback report
+    # Format top ports
+    top_ports_str = ', '.join(f'Port {p["port"]} ({p["count"]} alerts)' for p in top_ports[:3])
+    
+    # Format top MITRE techniques
+    top_mitre_str = ', '.join(f'{t["technique"]} ({t["count"]}x)' for t in top_mitre[:3])
+    
+    # Format top IPs
+    top_ips_str = ', '.join(f'{ip["ip"]} ({ip["count"]} alerts)' for ip in top_ips[:3])
+    
+    report_parts = [
+        f"**Daily SOC Summary Report - {datetime.now().strftime('%Y-%m-%d')}**\n\n",
+        f"**Executive Summary:**\n",
+        f"Today's security monitoring analyzed {stats.get('total_alerts', 0)} alerts across the network. "
+        f"Of these, {stats.get('high_risk_alerts', 0)} were flagged as high-risk threats with threat probability above 70%. "
+        f"The network observed activity from {stats.get('unique_source_ips', 0)} unique source IPs targeting {stats.get('unique_destination_ports', 0)} different destination ports.\n\n",
+        f"**Key Attack Patterns:**\n",
+        f"Top targeted ports: {top_ports_str}. "
+        f"Most common MITRE techniques observed: {top_mitre_str}.\n\n",
+        f"**Threat Assessment:**\n",
+        f"Average threat probability across all alerts: {stats.get('avg_threat_probability', 0):.1%}. "
+        f"Top attacking IPs by volume: {top_ips_str}.\n\n",
+        f"**Recommendations:**\n",
+        f"- Continue monitoring high-traffic ports for suspicious patterns\n",
+        f"- Investigate source IPs with high alert frequency\n",
+        f"- Review and update firewall rules for top targeted ports"
+    ]
+    
+    return "".join(report_parts)
+
+
+# -------- Attack Replay Simulation --------
+
+@app.get("/simulation/replay")
+def attack_replay_simulation(
+    port: int = Query(..., ge=1, le=65535, description="Port to simulate as unprotected"),
+    duration_hours: int = Query(24, ge=1, le=168, description="Duration of simulation in hours"),
+    limit: int = Query(1000, ge=100, le=10000, description="Number of alerts to analyze")
+):
+    """
+    Simulate what would happen if a certain port wasn't protected.
+    Shows potential attacks, impact, and risk assessment.
+    """
+    if not ALERTS or len(ALERTS) < 10:
+        return {
+            "port": port,
+            "duration_hours": duration_hours,
+            "simulated_attacks": [],
+            "impact_analysis": {},
+            "risk_assessment": {},
+            "message": "Insufficient data for simulation"
+        }
+    
+    # Get alerts targeting this port
+    recent_alerts = sorted(ALERTS, key=lambda x: int(x.get("row_id", 0)))[-limit:]
+    
+    # Filter alerts targeting this port
+    port_alerts = [a for a in recent_alerts if int(a.get("dst_port", 0)) == port]
+    
+    if not port_alerts:
+        return {
+            "port": port,
+            "duration_hours": duration_hours,
+            "simulated_attacks": [],
+            "impact_analysis": {
+                "projected_attacks": 0,
+                "projected_data_exfil": 0,
+                "projected_packets": 0
+            },
+            "risk_assessment": {
+                "risk_level": "low",
+                "recommendation": f"No historical attacks on port {port}. Risk assessment: Low risk if port remains unprotected."
+            },
+            "message": f"No historical attacks found on port {port}. Simulation cannot project future attacks."
+        }
+    
+    # Analyze attack patterns on this port
+    attack_ips = Counter(a.get("src_ip", "unknown") for a in port_alerts)
+    attack_protocols = Counter(a.get("protocol", "unknown") for a in port_alerts)
+    mitre_techniques = Counter()
+    for a in port_alerts:
+        tags = a.get("mitre_tags", [])
+        if isinstance(tags, list):
+            mitre_techniques.update(tags)
+    
+    # Calculate projected impact
+    total_bytes = sum(float(a.get("approx_bytes_per_s", 0)) for a in port_alerts)
+    total_packets = sum(float(a.get("approx_packets_per_s", 0)) for a in port_alerts)
+    avg_threat = np.mean([float(a.get("y_prob", 0)) for a in port_alerts]) if ANOMALY_DETECTION_AVAILABLE else 0.5
+    
+    # Project attacks over duration
+    # Assume alerts occur at similar rate over time
+    avg_alerts_per_hour = len(port_alerts) / max(1, duration_hours) if duration_hours > 0 else len(port_alerts)
+    projected_attacks = int(avg_alerts_per_hour * duration_hours)
+    
+    # Project data exfiltration (assume sustained attack)
+    projected_bytes_per_second = total_bytes / len(port_alerts) if port_alerts else 0
+    projected_total_bytes = projected_bytes_per_second * duration_hours * 3600
+    
+    # Project packet volume
+    projected_packets_per_second = total_packets / len(port_alerts) if port_alerts else 0
+    projected_total_packets = projected_packets_per_second * duration_hours * 3600
+    
+    # Build simulation results
+    simulated_attacks = []
+    for alert in port_alerts[:20]:  # Top 20 examples
+        simulated_attacks.append({
+            "row_id": alert.get("row_id", 0),
+            "src_ip": alert.get("src_ip", "unknown"),
+            "protocol": alert.get("protocol", "unknown"),
+            "threat_probability": alert.get("y_prob", 0),
+            "packets_per_sec": alert.get("approx_packets_per_s", 0),
+            "bytes_per_sec": alert.get("approx_bytes_per_s", 0),
+            "mitre_tags": alert.get("mitre_tags", []),
+            "simulated_impact": "High" if float(alert.get("y_prob", 0)) > 0.7 else "Medium" if float(alert.get("y_prob", 0)) > 0.5 else "Low"
+        })
+    
+    # Impact analysis
+    impact = {
+        "historical_attacks": len(port_alerts),
+        "projected_attacks": projected_attacks,
+        "unique_attackers": len(set(a.get("src_ip", "") for a in port_alerts)),
+        "projected_data_exfil_gb": round(projected_total_bytes / (1024**3), 2),
+        "projected_packets_millions": round(projected_total_packets / 1e6, 2),
+        "average_threat_probability": round(avg_threat, 3),
+        "top_attackers": [{"ip": ip, "count": count} for ip, count in attack_ips.most_common(5)],
+        "attack_protocols": [{"protocol": proto, "count": count} for proto, count in attack_protocols.most_common(3)],
+        "mitre_techniques": [{"technique": tech, "count": count} for tech, count in mitre_techniques.most_common(5)]
+    }
+    
+    # Risk assessment
+    risk_score = avg_threat * (len(port_alerts) / 100.0) * min(1.0, projected_attacks / 100.0)
+    
+    if risk_score > 0.7:
+        risk_level = "critical"
+        recommendation = f"⚠️ **CRITICAL**: Port {port} is highly targeted. Immediate firewall rule implementation recommended. " \
+                         f"Historical analysis shows {len(port_alerts)} attacks with average threat probability of {avg_threat:.1%}. " \
+                         f"Projected {projected_attacks} attacks over {duration_hours} hours if unprotected."
+    elif risk_score > 0.5:
+        risk_level = "high"
+        recommendation = f"⚠️ **HIGH RISK**: Port {port} shows significant attack activity. " \
+                         f"Recommend implementing port filtering or access control. " \
+                         f"Projected {projected_attacks} attacks if unprotected."
+    elif risk_score > 0.3:
+        risk_level = "medium"
+        recommendation = f"⚠️ **MEDIUM RISK**: Port {port} has moderate attack activity. " \
+                         f"Consider implementing additional security measures. " \
+                         f"Projected {projected_attacks} attacks if unprotected."
+    else:
+        risk_level = "low"
+        recommendation = f"ℹ️ **LOW RISK**: Port {port} shows minimal attack activity. " \
+                        f"Standard security measures should be sufficient. " \
+                        f"Projected {projected_attacks} attacks if unprotected."
+    
+    risk_assessment = {
+        "risk_level": risk_level,
+        "risk_score": round(risk_score, 3),
+        "recommendation": recommendation,
+        "urgency": "immediate" if risk_level == "critical" else "high" if risk_level == "high" else "medium" if risk_level == "medium" else "low"
+    }
+    
+    return {
+        "port": port,
+        "duration_hours": duration_hours,
+        "simulated_attacks": simulated_attacks,
+        "impact_analysis": impact,
+        "risk_assessment": risk_assessment,
+        "message": f"Simulation complete: Port {port} unprotected for {duration_hours} hours"
     }
